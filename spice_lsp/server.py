@@ -6,15 +6,12 @@ to provide rich IDE features for .spc files.
 """
 
 import logging
+import sys
 from typing import List, Optional
 from pathlib import Path
-import sys
 
-# Add parent directory to path to import spice package
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "spice-lang"))
-
-from pygls.server import LanguageServer
-from pygls.lsp.types import (
+from pygls.lsp.server import LanguageServer
+from lsprotocol.types import (
     Diagnostic,
     DiagnosticSeverity,
     Position,
@@ -32,18 +29,31 @@ from pygls.lsp.types import (
     DidSaveTextDocumentParams,
     TextDocumentPositionParams,
     Location,
+    PublishDiagnosticsParams,
+    TextDocumentSyncKind,
 )
 
 from spice.lexer import Lexer, TokenType
 from spice.parser import Parser
-from spice.compilation.pipeline import CompilationPipeline
+from spice.compilation.spicefile import SpiceFile
+from spice.compilation.checks import SymbolTableBuilder, TypeChecker, MethodOverloadResolver, InterfaceChecker, FinalChecker, CheckError
 from spice.errors import SpiceError
 
-logging.basicConfig(level=logging.INFO)
+# Set up file logging for debugging
+LOG_FILE = Path.home() / ".spice-lsp.log"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode='w'),
+        logging.StreamHandler(sys.stderr),
+    ]
+)
 logger = logging.getLogger(__name__)
+logger.info(f"Spice LSP starting, logging to {LOG_FILE}")
 
 # Spice Language Server
-server = LanguageServer("spice-lsp", "v0.1")
+server = LanguageServer("spice-lsp", "v0.1", text_document_sync_kind=TextDocumentSyncKind.Full)
 
 
 class SpiceDocument:
@@ -60,9 +70,12 @@ class SpiceDocument:
     def parse(self):
         """Parse the document and collect diagnostics."""
         try:
+            logger.debug(f"Parsing document: {self.uri}")
+
             # Tokenize
             lexer = Lexer()
             self.tokens = lexer.tokenize(self.source)
+            logger.debug(f"Tokenized {len(self.tokens)} tokens")
 
             # Check for lexer errors
             if lexer.errors:
@@ -81,8 +94,12 @@ class SpiceDocument:
 
             # Parse
             parser = Parser()
-            parser.tokens = self.tokens
-            self.ast = parser.parse()
+            self.ast = parser.parse(self.tokens)
+            logger.debug(f"Parsed AST with {len(self.ast.body) if self.ast else 0} top-level statements")
+
+            # Run semantic checks if parsing succeeded
+            if self.ast and not self.diagnostics:
+                self._run_semantic_checks()
 
         except SpiceError as e:
             # Handle Spice-specific errors
@@ -127,6 +144,77 @@ class SpiceDocument:
                 )
             )
 
+    def _make_diagnostic(self, error, source: str) -> Diagnostic:
+        """Create a diagnostic from an error, extracting line/column if available."""
+        # Handle CheckError with line/column
+        if isinstance(error, CheckError):
+            logger.debug(f"CheckError received: line={error.line}, column={error.column}, message={error.message}")
+            line = max(0, error.line - 1)  # LSP uses 0-indexed lines
+            column = max(0, error.column)
+            message = f"{error.message} ({error.line}:{error.column})"
+        # Handle errors with line/column attributes
+        elif hasattr(error, 'line') and hasattr(error, 'column'):
+            err_line = getattr(error, 'line', 1)
+            err_col = getattr(error, 'column', 0)
+            line = max(0, err_line - 1)
+            column = max(0, err_col)
+            message = f"{error} ({err_line}:{err_col})"
+        # Fallback for string errors
+        else:
+            line = 0
+            column = 0
+            message = str(error)
+
+        return Diagnostic(
+            range=Range(
+                start=Position(line=line, character=column),
+                end=Position(line=line, character=column + 10)
+            ),
+            message=message,
+            severity=DiagnosticSeverity.Error,
+            source=source
+        )
+
+    def _run_semantic_checks(self):
+        """Run semantic checks on the parsed AST."""
+        try:
+            spice_file = SpiceFile.empty(self.source)
+            spice_file.ast = self.ast
+
+            logger.debug("Building symbol table...")
+            symbol_builder = SymbolTableBuilder()
+            symbol_builder.check(spice_file)
+            logger.debug(f"Symbol table built: {spice_file.symbol_table is not None}")
+
+            logger.debug("Checking method overloads...")
+            overload_resolver = MethodOverloadResolver()
+            if not overload_resolver.check(spice_file):
+                for error in overload_resolver.errors:
+                    self.diagnostics.append(self._make_diagnostic(error, "spice-overload"))
+
+            logger.debug("Running type checker...")
+            type_checker = TypeChecker()
+            if not type_checker.check(spice_file):
+                for error in type_checker.errors:
+                    self.diagnostics.append(self._make_diagnostic(error, "spice-type"))
+
+            logger.debug("Checking interface implementations...")
+            interface_checker = InterfaceChecker()
+            if not interface_checker.check(spice_file):
+                for error in interface_checker.errors:
+                    self.diagnostics.append(self._make_diagnostic(error, "spice-interface"))
+
+            logger.debug("Checking final constraints...")
+            final_checker = FinalChecker()
+            if not final_checker.check(spice_file):
+                for error in final_checker.errors:
+                    self.diagnostics.append(self._make_diagnostic(error, "spice-final"))
+
+            logger.debug(f"Semantic checks complete, {len(self.diagnostics)} diagnostics")
+
+        except Exception as e:
+            logger.exception(f"Error during semantic checks: {e}")
+
 
 # Document cache
 documents: dict[str, SpiceDocument] = {}
@@ -145,7 +233,7 @@ def did_open(ls: LanguageServer, params: DidOpenTextDocumentParams):
     documents[uri] = doc
 
     # Send diagnostics
-    ls.publish_diagnostics(uri, doc.diagnostics)
+    ls.text_document_publish_diagnostics(PublishDiagnosticsParams(uri=uri, diagnostics=doc.diagnostics))
 
 
 @server.feature("textDocument/didChange")
@@ -164,7 +252,7 @@ def did_change(ls: LanguageServer, params: DidChangeTextDocumentParams):
         documents[uri] = doc
 
         # Send updated diagnostics
-        ls.publish_diagnostics(uri, doc.diagnostics)
+        ls.text_document_publish_diagnostics(PublishDiagnosticsParams(uri=uri, diagnostics=doc.diagnostics))
 
 
 @server.feature("textDocument/didSave")
@@ -175,7 +263,7 @@ def did_save(ls: LanguageServer, params: DidSaveTextDocumentParams):
 
     # Could trigger full compilation here if needed
     if uri in documents:
-        ls.publish_diagnostics(uri, documents[uri].diagnostics)
+        ls.text_document_publish_diagnostics(PublishDiagnosticsParams(uri=uri, diagnostics=documents[uri].diagnostics))
 
 
 @server.feature("textDocument/completion")
@@ -254,7 +342,6 @@ def hover(params: HoverParams) -> Optional[Hover]:
 
     word = line[start:end]
 
-    # Provide hover info for keywords
     hover_docs = {
         'interface': '**interface** keyword\n\nDeclares an interface (Protocol in Python) that defines method signatures',
         'abstract': '**abstract** modifier\n\nMarks a class or method as abstract (must be overridden)',
