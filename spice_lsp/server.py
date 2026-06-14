@@ -42,10 +42,19 @@ from lsprotocol.types import (
 
 from spice.lexer import Lexer, TokenType
 from spice.parser import Parser
-from spice.parser.ast_nodes import ClassDeclaration, FunctionDeclaration, InterfaceDeclaration
+from spice.parser.ast_nodes import (
+    ClassDeclaration,
+    FunctionDeclaration,
+    InterfaceDeclaration,
+    DataClassDeclaration,
+    EnumDeclaration,
+)
 from spice.compilation.spicefile import SpiceFile
 from spice.compilation.checks import SymbolTableBuilder, TypeChecker, MethodOverloadResolver, InterfaceChecker, FinalChecker, CheckError
 from spice.errors import SpiceError
+
+import spice.annotations.builtins
+from spice.annotations import all_processors
 
 # Set up file logging for debugging
 LOG_FILE = Path.home() / ".spice-lsp.log"
@@ -458,6 +467,10 @@ def _get_spice_file_exports(file_path: Path) -> List[Tuple[str, CompletionItemKi
         for node in ast.body:
             if isinstance(node, ClassDeclaration):
                 exports.append((node.name, CompletionItemKind.Class))
+            elif isinstance(node, DataClassDeclaration):
+                exports.append((node.name, CompletionItemKind.Class))
+            elif isinstance(node, EnumDeclaration):
+                exports.append((node.name, CompletionItemKind.Enum))
             elif isinstance(node, FunctionDeclaration):
                 exports.append((node.name, CompletionItemKind.Function))
             elif isinstance(node, InterfaceDeclaration):
@@ -718,7 +731,8 @@ def find_symbol_in_file(file_path: Path, symbol_name: str) -> Optional[Tuple[int
             ast = parser.parse(tokens)
 
             for node in ast.body:
-                if isinstance(node, (ClassDeclaration, FunctionDeclaration, InterfaceDeclaration)):
+                if isinstance(node, (ClassDeclaration, FunctionDeclaration, InterfaceDeclaration,
+                                     DataClassDeclaration, EnumDeclaration)):
                     if node.name == symbol_name:
                         # AST nodes use 1-indexed lines
                         return (node.line - 1, node.column)
@@ -765,9 +779,14 @@ def get_keyword_completions() -> CompletionList:
     items: List[CompletionItem] = []
 
     keywords = [
+        # Spice keywords
         'interface', 'abstract', 'final', 'static', 'extends', 'implements',
+        'data', 'enum', 'switch', 'case', 'default',
+        # Python keywords
         'def', 'class', 'if', 'elif', 'else', 'for', 'while', 'return',
-        'import', 'from', 'as', 'pass', 'break', 'continue', 'switch', 'case', 'default'
+        'import', 'from', 'as', 'with', 'try', 'except', 'finally', 'raise',
+        'pass', 'break', 'continue', 'lambda', 'and', 'or', 'not', 'in', 'is',
+        'True', 'False', 'None',
     ]
 
     for keyword in keywords:
@@ -791,7 +810,80 @@ def get_keyword_completions() -> CompletionList:
             detail="Abstract class declaration",
             insert_text="abstract class ${1:Name} {\n\tabstract def ${2:method}() -> ${3:ReturnType};\n}"
         ),
+        CompletionItem(
+            label="enum",
+            kind=CompletionItemKind.Snippet,
+            detail="Enum declaration",
+            insert_text="enum ${1:Name} {\n\t${2:FIRST},\n\t${3:SECOND}\n}"
+        ),
+        CompletionItem(
+            label="data class",
+            kind=CompletionItemKind.Snippet,
+            detail="Data class declaration",
+            insert_text="data class ${1:Name}(${2:field}: ${3:Type});"
+        ),
+        CompletionItem(
+            label="switch",
+            kind=CompletionItemKind.Snippet,
+            detail="Switch statement",
+            insert_text="switch (${1:value}) {\n\tcase ${2:pattern}: {\n\t\t${3:pass};\n\t}\n\tdefault: {\n\t\t${4:pass};\n\t}\n}"
+        ),
     ])
+
+    return CompletionList(is_incomplete=False, items=items)
+
+
+def _annotation_doc(name: str) -> str:
+    """Build hover/detail markdown for a registered compile-time annotation."""
+    proc = all_processors().get(name)
+    if proc is None:
+        return ""
+    doc = (type(proc).__doc__ or "").strip()
+    targets = getattr(proc, "targets", ()) or ()
+    target_str = ", ".join(t.__name__ for t in targets) if targets else "any declaration"
+    parts = [f"**@!{name}** compile-time annotation", f"Applies to: {target_str}"]
+    if doc:
+        parts.append(doc)
+    return "\n\n".join(parts)
+
+
+def detect_annotation_context(source: str, position: Position) -> Dict:
+    """Detect whether the cursor is typing an annotation prefix.
+
+    Returns {"in_annotation": bool, "retention": "compile_time"|"runtime", "partial": str}.
+    """
+    result = {"in_annotation": False, "retention": "runtime", "partial": ""}
+
+    lines = source.split('\n')
+    if position.line >= len(lines):
+        return result
+
+    line_before_cursor = lines[position.line][:position.character]
+
+    match = re.match(r'^\s*(@!?)([\w.]*)$', line_before_cursor)
+    if match:
+        result["in_annotation"] = True
+        result["retention"] = "compile_time" if match.group(1) == "@!" else "runtime"
+        result["partial"] = match.group(2)
+    return result
+
+
+def get_annotation_completions(context: Dict) -> CompletionList:
+    """Suggest registered compile-time annotation processors for '@!'."""
+    items: List[CompletionItem] = []
+
+    # Only '@!' has a known registry; runtime '@' decorators are arbitrary Python.
+    if context["retention"] == "compile_time":
+        partial = context["partial"].lower()
+        for name in sorted(all_processors()):
+            if partial and not name.lower().startswith(partial):
+                continue
+            items.append(CompletionItem(
+                label=name,
+                kind=CompletionItemKind.Function,
+                detail="Compile-time annotation",
+                documentation=MarkupContent(kind=MarkupKind.Markdown, value=_annotation_doc(name)),
+            ))
 
     return CompletionList(is_incomplete=False, items=items)
 
@@ -904,6 +996,12 @@ def completions(params: CompletionParams) -> Optional[CompletionList]:
 
     doc = documents[uri]
 
+    # Check if we're typing an annotation prefix '@' / '@!'
+    annotation_ctx = detect_annotation_context(doc.source, position)
+    if annotation_ctx["in_annotation"]:
+        logger.debug(f"Annotation context detected: {annotation_ctx}")
+        return get_annotation_completions(annotation_ctx)
+
     # Check if we're in an import context
     import_ctx = detect_import_context(doc.source, position)
 
@@ -991,6 +1089,11 @@ def hover(params: HoverParams) -> Optional[Hover]:
         'static': '**static** modifier\n\nDeclares a static method that belongs to the class rather than instances',
         'extends': '**extends** keyword\n\nSpecifies class inheritance',
         'implements': '**implements** keyword\n\nSpecifies that a class implements one or more interfaces',
+        'data': '**data** modifier\n\nDeclares a data class (auto-generated `__init__`, equality, and repr from its fields)',
+        'enum': '**enum** keyword\n\nDeclares an enumeration of named members',
+        'switch': '**switch** keyword\n\nMatches a value against `case` patterns, with an optional `default` branch',
+        'case': '**case** keyword\n\nA branch of a `switch` statement matched against a pattern',
+        'default': '**default** keyword\n\nThe fallback branch of a `switch` statement',
     }
 
     if word in hover_docs:
@@ -998,6 +1101,14 @@ def hover(params: HoverParams) -> Optional[Hover]:
             contents=MarkupContent(
                 kind=MarkupKind.Markdown,
                 value=hover_docs[word]
+            )
+        )
+
+    if word in all_processors():
+        return Hover(
+            contents=MarkupContent(
+                kind=MarkupKind.Markdown,
+                value=_annotation_doc(word)
             )
         )
 
