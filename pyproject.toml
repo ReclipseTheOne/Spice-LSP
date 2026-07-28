@@ -4,29 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spice-lsp"
-version = "0.3.1"
+version = "0.4.0"
 description = "Language Server Protocol implementation for Spice language"
 authors = [
     { name = "Reclipse" }
 ]
-requires-python = ">=3.8"
+# Tracks spice-lang's floor: the server imports spice, so it can't claim wider.
+requires-python = ">=3.10"
 dependencies = [
     "pygls>=1.0.0",
     "lsprotocol>=2023.0.0",
-    "spice-lang>=0.3.1",
+    "spice-lang>=0.4.0",
 ]
 
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
 ]
 
 [project.scripts]
@@ -35,3 +39,7 @@ spice-lsp = "spice_lsp.server:start_server"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["spice_lsp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

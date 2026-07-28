@@ -9,12 +9,10 @@ import logging
 import sys
 import re
 import sysconfig
-import site
 import importlib
 from decimal import Decimal, InvalidOperation
 from typing import List, Optional, Dict, Tuple
 from pathlib import Path
-from urllib.parse import urlparse, unquote
 
 from pygls.lsp.server import LanguageServer
 from lsprotocol.types import (
@@ -38,9 +36,14 @@ from lsprotocol.types import (
     PublishDiagnosticsParams,
     TextDocumentSyncKind,
     DefinitionParams,
+    DocumentSymbol,
+    DocumentSymbolParams,
+    SymbolKind,
+    DidChangeWatchedFilesParams,
+    InitializeParams,
 )
 
-from spice.lexer import Lexer, TokenType
+from spice.lexer import Lexer
 from spice.parser import Parser
 from spice.parser.ast_nodes import (
     ClassDeclaration,
@@ -50,11 +53,13 @@ from spice.parser.ast_nodes import (
     EnumDeclaration,
 )
 from spice.compilation.spicefile import SpiceFile
-from spice.compilation.checks import SymbolTableBuilder, TypeChecker, MethodOverloadResolver, InterfaceChecker, FinalChecker, CheckError
+from spice.compilation.checks import CheckError
 from spice.errors import SpiceError
 
 import spice.annotations.builtins
 from spice.annotations import all_processors
+
+from spice_lsp.workspace import SpiceWorkspace, path_to_uri, uri_to_path
 
 # Set up file logging for debugging
 LOG_FILE = Path.home() / ".spice-lsp.log"
@@ -72,51 +77,55 @@ logger.info(f"Spice LSP starting, logging to {LOG_FILE}")
 # Spice Language Server
 server = LanguageServer("spice-lsp", "v0.1", text_document_sync_kind=TextDocumentSyncKind.Full)
 
+# Every project the editor has a file open in. Module resolution and the
+# compile-time checks both go through this, so the server and the compiler
+# answer the same question the same way.
+workspace = SpiceWorkspace()
+
 
 class SpiceDocument:
-    """Represents a parsed Spice document with AST and diagnostics."""
+    """One open Spice document, checked against the project it belongs to."""
 
     def __init__(self, uri: str, source: str):
         self.uri = uri
         self.source = source
+        self.path = uri_to_path(uri)
         self.diagnostics: List[Diagnostic] = []
         self.ast = None
         self.tokens = []
         self.spice_file: Optional[SpiceFile] = None
         self.parse()
 
+    @property
+    def project(self):
+        """The build this document sits in, or None if it was never analyzed."""
+        return getattr(self.spice_file, "project", None)
+
     def parse(self):
         """Parse the document and collect diagnostics."""
         try:
             logger.debug(f"Parsing document: {self.uri}")
 
-            # Tokenize
-            lexer = Lexer()
-            self.tokens = lexer.tokenize(self.source)
-            logger.debug(f"Tokenized {len(self.tokens)} tokens")
+            if self.path is None:
+                # Not a file on disk - an untitled buffer, say. Nothing can be
+                # resolved against it, so check what there is on its own.
+                self._parse_standalone()
+                return
 
-            # Check for lexer errors
-            if lexer.errors:
-                for error in lexer.errors:
-                    self.diagnostics.append(
-                        Diagnostic(
-                            range=Range(
-                                start=Position(line=error.line - 1, character=error.column),
-                                end=Position(line=error.line - 1, character=error.column + 1)
-                            ),
-                            message=str(error),
-                            severity=DiagnosticSeverity.Error,
-                            source="spice-lexer"
-                        )
-                    )
+            analysis = workspace.analyze(self.path, self.source)
 
-            # Parse
-            parser = Parser()
-            self.ast = parser.parse(self.tokens)
-            logger.debug(f"Parsed AST with {len(self.ast.body) if self.ast else 0} top-level statements")
+            self.spice_file = analysis.file
+            self.ast = analysis.file.ast
+            self.tokens = analysis.file.tokens
 
-            if self.ast:
-                self._run_semantic_checks()
+            for source, error in analysis.errors:
+                self.diagnostics.append(self._make_diagnostic(error, source))
+            for source, warning in analysis.warnings:
+                self.diagnostics.append(
+                    self._make_diagnostic(warning, source, DiagnosticSeverity.Warning)
+                )
+
+            logger.debug(f"Analysis complete, {len(self.diagnostics)} diagnostics")
 
         except SpiceError as e:
             # Handle Spice-specific errors
@@ -161,7 +170,24 @@ class SpiceDocument:
                 )
             )
 
-    def _make_diagnostic(self, error, source: str) -> Diagnostic:
+    def _parse_standalone(self):
+        """Check a buffer with no path of its own.
+
+        Nothing here can resolve an import, so this is the old single-file
+        behaviour: what the file declares is all it knows about.
+        """
+        self.tokens = Lexer().tokenize(self.source)
+        self.ast = Parser().parse(self.tokens)
+
+        self.spice_file = SpiceFile.empty(self.source)
+        self.spice_file.ast = self.ast
+        self.spice_file.tokens = self.tokens
+
+        from spice.compilation.checks import SymbolTableBuilder
+        SymbolTableBuilder().check(self.spice_file)
+
+    def _make_diagnostic(self, error, source: str,
+                         severity: DiagnosticSeverity = DiagnosticSeverity.Error) -> Diagnostic:
         """Create a diagnostic from an error, extracting line/column if available."""
         # Handle CheckError with line/column
         if isinstance(error, CheckError):
@@ -188,137 +214,48 @@ class SpiceDocument:
                 end=Position(line=line, character=column + 10)
             ),
             message=message,
-            severity=DiagnosticSeverity.Error,
+            severity=severity,
             source=source
         )
-
-    def _run_semantic_checks(self):
-        """Run semantic checks on the parsed AST."""
-        try:
-            self.spice_file = SpiceFile.empty(self.source)
-            self.spice_file.ast = self.ast
-
-            logger.debug("Building symbol table...")
-            symbol_builder = SymbolTableBuilder()
-            symbol_builder.check(self.spice_file)
-            logger.debug(f"Symbol table built: {self.spice_file.symbol_table is not None}")
-            if self.spice_file.symbol_table:
-                classes = list(self.spice_file.symbol_table.classes.keys())
-                interfaces = list(self.spice_file.symbol_table.interfaces.keys())
-                logger.debug(f"Symbol table - classes: {classes}, interfaces: {interfaces}")
-
-            logger.debug("Checking method overloads...")
-            overload_resolver = MethodOverloadResolver()
-            if not overload_resolver.check(self.spice_file):
-                for error in overload_resolver.errors:
-                    self.diagnostics.append(self._make_diagnostic(error, "spice-overload"))
-
-            logger.debug("Running type checker...")
-            type_checker = TypeChecker()
-            if not type_checker.check(self.spice_file):
-                for error in type_checker.errors:
-                    self.diagnostics.append(self._make_diagnostic(error, "spice-type"))
-
-            logger.debug("Checking interface implementations...")
-            interface_checker = InterfaceChecker()
-            if not interface_checker.check(self.spice_file):
-                for error in interface_checker.errors:
-                    self.diagnostics.append(self._make_diagnostic(error, "spice-interface"))
-
-            logger.debug("Checking final constraints...")
-            final_checker = FinalChecker()
-            if not final_checker.check(self.spice_file):
-                for error in final_checker.errors:
-                    self.diagnostics.append(self._make_diagnostic(error, "spice-final"))
-
-            logger.debug(f"Semantic checks complete, {len(self.diagnostics)} diagnostics")
-
-        except Exception as e:
-            logger.exception(f"Error during semantic checks: {e}")
 
 
 # Document cache
 documents: dict[str, SpiceDocument] = {}
 
-# Module discovery caches
+# Module discovery caches. Both are dropped whenever the workspace is, since
+# what a module exports is exactly what changes when a file is saved.
 _module_cache: Dict[str, Dict] = {}  # uri -> {stdlib, packages, spice, all}
 _export_cache: Dict[str, List[Tuple[str, CompletionItemKind]]] = {}  # module_name -> [(name, kind)]
 
 
-# Import Intellisense helpers
+def invalidate_caches() -> None:
+    """Forget everything read off disk."""
+    workspace.invalidate()
+    _module_cache.clear()
+    _export_cache.clear()
+
+
 def _uri_to_path(uri: str) -> Optional[Path]:
     """Convert a file:// URI to a Path."""
-    if uri.startswith("file://"):
-        # Handle Windows paths (file:///C:/...)
-        path_str = unquote(urlparse(uri).path)
-        if sys.platform == "win32" and path_str.startswith("/"):
-            path_str = path_str[1:]  # Remove leading slash for Windows
-        return Path(path_str)
-    return None
+    return uri_to_path(uri)
 
 
 def get_lookup_paths(document_uri: str) -> List[Path]:
-    """Get lookup paths for module discovery, similar to pipeline.py."""
-    paths: List[Path] = []
+    """Where module names are looked up for this document.
 
-    # I don't know if the order is *really* important, should also make a vscode config for more paths tbf (and ofc cli commands)
-
-    # Document's directory
+    The project's own list, in the project's own order. This used to be a
+    second implementation living beside the compiler's, and the two disagreed
+    about which directory a bare module name resolves against.
+    """
     doc_path = _uri_to_path(document_uri)
-    if doc_path and doc_path.parent.exists():
-        paths.append(doc_path.parent)
+    if doc_path is None:
+        return []
 
-    # Current working directory
-    cwd = Path.cwd()
-    if cwd.exists() and cwd not in paths:
-        paths.append(cwd)
-
-    # Python environment paths
-    try:
-        purelib = sysconfig.get_path('purelib')
-        if purelib:
-            paths.append(Path(purelib))
-    except Exception:
-        pass
-
-    try:
-        platlib = sysconfig.get_path('platlib')
-        if platlib:
-            paths.append(Path(platlib))
-    except Exception:
-        pass
-
-    try:
-        user_site = site.getusersitepackages()
-        if user_site:
-            paths.append(Path(user_site))
-    except Exception:
-        pass
-
-    try:
-        stdlib = sysconfig.get_path('stdlib')
-        if stdlib:
-            paths.append(Path(stdlib))
-    except Exception:
-        pass
-
-    try:
-        for site_path in site.getsitepackages():
-            paths.append(Path(site_path))
-    except Exception:
-        pass
-
-    # Filter to existing, unique paths
-    seen = set()
-    result = []
-    for p in paths:
-        if p and p.exists():
-            resolved = p.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                result.append(p)
-
-    return result
+    project = workspace.project_for(doc_path)
+    file = project.modules.get(doc_path.resolve())
+    if file is not None:
+        return list(project.lookup_paths_for(file))
+    return [doc_path.parent] + list(project.base_lookup_paths)
 
 
 def scan_for_modules(document_uri: str) -> Dict:
@@ -689,35 +626,18 @@ def detect_import_definition_context(source: str, position: Position) -> Optiona
 
 
 def resolve_module_path(module_name: str, document_uri: str) -> Optional[Path]:
-    """Resolve a module name to its file path."""
+    """Resolve a module name to its file path, the way a build would.
+
+    Handed to the project rather than repeated here, so a jump-to-definition on
+    an import line lands on the file the compiler would actually have read.
+    """
     doc_path = _uri_to_path(document_uri)
-    paths = get_lookup_paths(document_uri)
+    if doc_path is None:
+        return None
 
-    # Convert dotted module name to path
-    module_path_part = module_name.replace('.', '/')
-
-    for base_path in paths:
-        # Check for .spc file
-        spc_file = base_path / f"{module_path_part}.spc"
-        if spc_file.exists():
-            return spc_file
-
-        # Check for .spc package
-        spc_pkg = base_path / module_path_part / "__init__.spc"
-        if spc_pkg.exists():
-            return spc_pkg
-
-        # Check for .py file
-        py_file = base_path / f"{module_path_part}.py"
-        if py_file.exists():
-            return py_file
-
-        # Check for Python package
-        py_pkg = base_path / module_path_part / "__init__.py"
-        if py_pkg.exists():
-            return py_pkg
-
-    return None
+    project = workspace.project_for(doc_path)
+    file = project.modules.get(doc_path.resolve())
+    return project.resolve_module(module_name, file)
 
 
 def find_symbol_in_file(file_path: Path, symbol_name: str) -> Optional[Tuple[int, int]]:
@@ -763,15 +683,24 @@ def find_symbol_in_file(file_path: Path, symbol_name: str) -> Optional[Tuple[int
     return None
 
 
-def path_to_uri(path: Path) -> str:
-    """Convert a Path to a file:// URI."""
-    resolved = path.resolve()
-    if sys.platform == "win32":
-        # Windows: file:///C:/path/to/file
-        return f"file:///{resolved.as_posix()}"
-    else:
-        # Unix: file:///path/to/file
-        return f"file://{resolved.as_posix()}"
+def _declaration_location(module: SpiceFile, node: object, name: str) -> Optional[Location]:
+    """A Location for `name` declared at `node`, in whichever module owns it.
+
+    The module is the point. Definition used to answer with the current
+    document's URI whatever it found, so following an imported class jumped to
+    that line number in the file being edited - a different piece of code.
+    """
+    line = getattr(node, "line", None)
+    if line is None:
+        return None
+
+    column = getattr(node, "column", 0) or 0
+    target = Position(line=max(0, line - 1), character=column)
+
+    return Location(
+        uri=path_to_uri(module.path),
+        range=Range(start=target, end=Position(line=target.line, character=column + len(name))),
+    )
 
 
 def get_keyword_completions() -> CompletionList:
@@ -833,6 +762,82 @@ def get_keyword_completions() -> CompletionList:
     return CompletionList(is_incomplete=False, items=items)
 
 
+# How a symbol kind shows up in a completion list.
+SYMBOL_COMPLETION_KINDS = {
+    "class": CompletionItemKind.Class,
+    "interface": CompletionItemKind.Interface,
+    "function": CompletionItemKind.Function,
+    "variable": CompletionItemKind.Variable,
+}
+
+
+def _signature_of(kind: str, symbol: object) -> str:
+    """A one-line rendering of a declaration, for hover and completion detail."""
+    node = getattr(symbol, "node", None)
+    name = getattr(symbol, "name", "")
+
+    if kind == "interface":
+        methods = getattr(node, "methods", []) or []
+        return f"interface {name} ({len(methods)} method{'s' if len(methods) != 1 else ''})"
+
+    if kind == "class":
+        parts = []
+        bases = list(getattr(node, "bases", []) or [])
+        interfaces = list(getattr(node, "interfaces", []) or [])
+        type_parameters = [tp.name for tp in getattr(node, "type_parameters", []) or []]
+
+        head = f"class {name}"
+        if type_parameters:
+            head += "<" + ", ".join(type_parameters) + ">"
+        parts.append(head)
+        if bases:
+            parts.append("extends " + ", ".join(bases))
+        if interfaces:
+            parts.append("implements " + ", ".join(interfaces))
+        return " ".join(parts)
+
+    if kind in ("function", "method"):
+        params = getattr(symbol, "params", []) or []
+        rendered = ", ".join(
+            f"{p.name}: {p.type_annotation}" if p.type_annotation else p.name
+            for p in params
+            if p.name != "self"
+        )
+        returns = getattr(symbol, "return_type", None)
+        suffix = f" -> {returns}" if returns else ""
+        return f"def {name}({rendered}){suffix}"
+
+    annotation = getattr(symbol, "type_annotation", None)
+    return f"{name}: {annotation}" if annotation else str(name)
+
+
+def get_symbol_completions(doc: "SpiceDocument") -> List[CompletionItem]:
+    """Everything the document can name - its own declarations and its imports.
+
+    Completion used to offer keywords and nothing else, so a class from another
+    module had to be typed out in full and spelled right.
+    """
+    if doc.spice_file is None:
+        return []
+
+    items: List[CompletionItem] = []
+
+    for name, (kind, symbol) in sorted(workspace.visible_symbols(doc.spice_file).items()):
+        items.append(CompletionItem(
+            label=name,
+            kind=SYMBOL_COMPLETION_KINDS.get(kind, CompletionItemKind.Variable),
+            detail=_signature_of(kind, symbol),
+            documentation=MarkupContent(
+                kind=MarkupKind.Markdown,
+                value=f"```spice\n{_signature_of(kind, symbol)}\n```",
+            ),
+            # After keywords, which are what a bare prefix usually means.
+            sort_text=f"zz{name}",
+        ))
+
+    return items
+
+
 def _annotation_doc(name: str) -> str:
     """Build hover/detail markdown for a registered compile-time annotation."""
     proc = all_processors().get(name)
@@ -888,6 +893,65 @@ def get_annotation_completions(context: Dict) -> CompletionList:
     return CompletionList(is_incomplete=False, items=items)
 
 
+@server.feature("initialize")
+def initialize(ls: LanguageServer, params: InitializeParams):
+    """Take the client's workspace folders and any configured search paths.
+
+    The folders matter: they tell the server what a dotted module name resolves
+    against. Guessing that from the open file alone works for a flat directory
+    and gets a package layout wrong.
+    """
+    folders: List[Path] = []
+
+    for folder in getattr(params, "workspace_folders", None) or []:
+        path = uri_to_path(getattr(folder, "uri", ""))
+        if path is not None:
+            folders.append(path)
+
+    root_uri = getattr(params, "root_uri", None)
+    if not folders and root_uri:
+        path = uri_to_path(root_uri)
+        if path is not None:
+            folders.append(path)
+
+    extra = _configured_lookup_paths(getattr(params, "initialization_options", None))
+
+    logger.info(f"Workspace folders: {folders}; extra lookup paths: {extra}")
+    workspace.configure(workspace_folders=folders, extra_paths=extra)
+
+
+def _configured_lookup_paths(options: object) -> List[Path]:
+    """`spice.lookupPaths` from the client, if it sent any.
+
+    The server used to carry a note wishing for this - a project that keeps its
+    sources under `src/` has no way to say so otherwise.
+    """
+    if not options:
+        return []
+
+    raw = None
+    if isinstance(options, dict):
+        raw = options.get("lookupPaths")
+    else:
+        raw = getattr(options, "lookupPaths", None)
+
+    if not raw:
+        return []
+
+    paths: List[Path] = []
+    for entry in raw:
+        try:
+            candidate = Path(str(entry)).expanduser()
+            if candidate.exists():
+                paths.append(candidate)
+            else:
+                logger.warning(f"Configured lookup path does not exist: {candidate}")
+        except Exception as error:
+            logger.warning(f"Bad lookup path {entry!r}: {error}")
+
+    return paths
+
+
 @server.feature("textDocument/didOpen")
 def did_open(ls: LanguageServer, params: DidOpenTextDocumentParams):
     """Handle document open event."""
@@ -925,13 +989,17 @@ def did_change(ls: LanguageServer, params: DidChangeTextDocumentParams):
 
 @server.feature("textDocument/didSave")
 def did_save(ls: LanguageServer, params: DidSaveTextDocumentParams):
-    """Handle document save event."""
+    """Handle document save event.
+
+    A save is the moment what other files see of this one changes, so the
+    cached projects go and every open document is re-checked against fresh
+    sources.
+    """
     uri = params.text_document.uri
     logger.info(f"Document saved: {uri}")
 
-    # Could trigger full compilation here if needed
-    if uri in documents:
-        ls.text_document_publish_diagnostics(PublishDiagnosticsParams(uri=uri, diagnostics=documents[uri].diagnostics))
+    invalidate_caches()
+    _republish_all(ls)
 
 
 def _handle_import_definition(uri: str, import_ctx: Dict) -> Optional[Location]:
@@ -1009,8 +1077,10 @@ def completions(params: CompletionParams) -> Optional[CompletionList]:
         logger.debug(f"Import context detected: {import_ctx}")
         return get_import_completions(uri, import_ctx)
 
-    # Default: return keyword completions
-    return get_keyword_completions()
+    # Keywords and snippets, plus everything this file can actually name.
+    result = get_keyword_completions()
+    result.items.extend(get_symbol_completions(doc))
+    return result
 
 
 @server.feature("textDocument/hover")
@@ -1112,6 +1182,22 @@ def hover(params: HoverParams) -> Optional[Hover]:
             )
         )
 
+    # A declared name: show what it actually is, and where it came from.
+    if doc.spice_file is not None and word:
+        found = workspace.declaration_of(doc.spice_file, word)
+        if found is not None:
+            module, kind, symbol = found
+            lines = [f"```spice\n{_signature_of(kind, symbol)}\n```"]
+            if module.path != doc.spice_file.path:
+                lines.append(f"*from `{module.path.name}`*")
+            return Hover(
+                contents=MarkupContent(kind=MarkupKind.Markdown, value="\n\n".join(lines)),
+                range=Range(
+                    start=Position(line=position.line, character=start),
+                    end=Position(line=position.line, character=end),
+                ),
+            )
+
     return None
 
 
@@ -1156,68 +1242,133 @@ def definition(params: DefinitionParams) -> Optional[Location]:
 
     logger.debug(f"Looking up definition for: '{word}'")
 
-    # Check SymbolTable for interfaces, classes, and functions
-    if doc.spice_file and doc.spice_file.symbol_table:
-        symbol_table = doc.spice_file.symbol_table
-
-        # Look up interface
-        if word in symbol_table.interfaces:
-            interface_symbol = symbol_table.interfaces[word]
-            node = interface_symbol.node
-            logger.debug(f"Found interface: {word} at line {node.line}, column {node.column}")
-            return Location(
-                uri=uri,
-                range=Range(
-                    start=Position(line=node.line - 1, character=node.column),
-                    end=Position(line=node.line - 1, character=node.column + len(word))
-                )
-            )
-
-        # Look up class
-        if word in symbol_table.classes:
-            class_symbol = symbol_table.classes[word]
-            node = class_symbol.node
-            logger.debug(f"Found class: {word} at line {node.line}, column {node.column}")
-            return Location(
-                uri=uri,
-                range=Range(
-                    start=Position(line=node.line - 1, character=node.column),
-                    end=Position(line=node.line - 1, character=node.column + len(word))
-                )
-            )
-
-        # Look up global function
-        global_scope = symbol_table.scopes.get("global")
-        if global_scope and word in global_scope.functions:
-            func_symbols = global_scope.functions[word]
-            if func_symbols:
-                node = func_symbols[0].node
-                logger.debug(f"Found function: {word} at line {node.line}, column {node.column}")
-                return Location(
-                    uri=uri,
-                    range=Range(
-                        start=Position(line=node.line - 1, character=node.column),
-                        end=Position(line=node.line - 1, character=node.column + len(word))
-                    )
-                )
-
-        # Look up method in any class
-        for class_name, class_symbol in symbol_table.classes.items():
-            if word in class_symbol.methods:
-                method_symbols = class_symbol.methods[word]
-                if method_symbols:
-                    node = method_symbols[0].node
-                    logger.debug(f"Found method: {class_name}.{word} at line {node.line}, column {node.column}")
-                    return Location(
-                        uri=uri,
-                        range=Range(
-                            start=Position(line=node.line - 1, character=node.column),
-                            end=Position(line=node.line - 1, character=node.column + len(word))
-                        )
-                    )
+    # Searched through the project, so a name that came in on an import
+    # resolves - and resolves to the module that actually declares it.
+    if doc.spice_file is not None:
+        found = workspace.declaration_of(doc.spice_file, word)
+        if found is not None:
+            module, kind, symbol = found
+            node = symbol.node
+            logger.debug(f"Found {kind} '{word}' in {module.path}")
+            location = _declaration_location(module, node, word)
+            if location is not None:
+                return location
 
     logger.debug(f"Symbol '{word}' not found")
     return None
+
+
+@server.feature("textDocument/documentSymbol")
+def document_symbols(params: DocumentSymbolParams) -> Optional[List[DocumentSymbol]]:
+    """The outline: what this file declares, with its members nested inside."""
+    uri = params.text_document.uri
+    doc = documents.get(uri)
+    if doc is None or doc.ast is None:
+        return None
+
+    symbols: List[DocumentSymbol] = []
+    for node in doc.ast.body:
+        symbol = _outline_symbol(node)
+        if symbol is not None:
+            symbols.append(symbol)
+
+    return symbols or None
+
+
+# What each declaration looks like in the outline.
+OUTLINE_KINDS = {
+    ClassDeclaration: SymbolKind.Class,
+    DataClassDeclaration: SymbolKind.Struct,
+    EnumDeclaration: SymbolKind.Enum,
+    InterfaceDeclaration: SymbolKind.Interface,
+    FunctionDeclaration: SymbolKind.Function,
+}
+
+
+def _node_range(node: object, name: str) -> Range:
+    """A node's own line, which is all the AST records of its extent.
+
+    Declarations carry a start position and no end, so the whole declaration and
+    its selection range are the same span. Editors accept that; it just means
+    the outline highlights the header rather than the body.
+    """
+    line = max(0, (getattr(node, "line", 1) or 1) - 1)
+    column = getattr(node, "column", 0) or 0
+    return Range(
+        start=Position(line=line, character=column),
+        end=Position(line=line, character=column + len(name)),
+    )
+
+
+def _outline_symbol(node: object) -> Optional[DocumentSymbol]:
+    kind = OUTLINE_KINDS.get(type(node))
+    if kind is None:
+        return None
+
+    name = getattr(node, "name", None)
+    if not name:
+        return None
+
+    children: List[DocumentSymbol] = []
+    for member in getattr(node, "body", []) or []:
+        child = _outline_symbol(member)
+        if child is not None:
+            children.append(child)
+
+    # An interface's signatures aren't in `body`, and a data class's fields
+    # aren't either - both are worth showing.
+    for signature in getattr(node, "methods", []) or []:
+        signature_name = getattr(signature, "name", None)
+        if signature_name:
+            children.append(DocumentSymbol(
+                name=signature_name,
+                kind=SymbolKind.Method,
+                range=_node_range(signature, signature_name),
+                selection_range=_node_range(signature, signature_name),
+            ))
+
+    for field in getattr(node, "fields", []) or []:
+        field_name = getattr(field, "name", None)
+        if field_name:
+            children.append(DocumentSymbol(
+                name=field_name,
+                detail=getattr(field, "type_annotation", None),
+                kind=SymbolKind.Field,
+                range=_node_range(node, field_name),
+                selection_range=_node_range(node, field_name),
+            ))
+
+    span = _node_range(node, name)
+    return DocumentSymbol(
+        name=name,
+        kind=kind,
+        range=span,
+        selection_range=span,
+        children=children or None,
+    )
+
+
+@server.feature("workspace/didChangeWatchedFiles")
+def did_change_watched_files(ls: LanguageServer, params: DidChangeWatchedFilesParams):
+    """A .spc file changed outside the editor - drop what was read off disk."""
+    logger.info("Watched files changed; invalidating workspace")
+    invalidate_caches()
+    _republish_all(ls)
+
+
+def _republish_all(ls: LanguageServer) -> None:
+    """Re-check every open document and publish the result.
+
+    A change in one module can turn a diagnostic in another on or off - that is
+    the point of resolving across modules - so the file being edited is not the
+    only one whose squiggles may be out of date.
+    """
+    for uri, existing in list(documents.items()):
+        refreshed = SpiceDocument(uri, existing.source)
+        documents[uri] = refreshed
+        ls.text_document_publish_diagnostics(
+            PublishDiagnosticsParams(uri=uri, diagnostics=refreshed.diagnostics)
+        )
 
 
 def start_server():
